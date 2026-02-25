@@ -42,13 +42,17 @@ const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_SCRIPT: &str = include_str!("provision.sh");
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[derive(Clone)]
 enum LoginAction {
     Expect { text: String, timeout: Duration },
-    Send(String),
+    Input(String),
     Script { path: PathBuf, index: usize },
 }
-use LoginAction::*;
+use LoginAction::{Expect, Input, Script};
 
 #[derive(Clone)]
 struct DirectoryShare {
@@ -208,14 +212,14 @@ Options
     let mut directory_shares = Vec::new();
 
     if !args.no_default_mounts {
-        login_actions.push(Send(format!("cd {project_name}")));
+        login_actions.push(Input(format!("cd {}", shell_quote(&project_name))));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
         for subfolder in [".git", ".vibe"] {
             if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r"mount -t tmpfs tmpfs {}", subfolder)))
+                login_actions.push(Input(format!(r"mount -t tmpfs tmpfs {}", shell_quote(subfolder))))
             }
         }
 
@@ -253,9 +257,7 @@ Options
         directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
     }
 
-    if let Some(motd_action) = motd_login_action(&directory_shares) {
-        login_actions.push(motd_action);
-    }
+    login_actions.push(motd_login_action(&directory_shares));
 
     // Any user-provided login actions must come after our system ones
     login_actions.extend(args.login_actions);
@@ -328,7 +330,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 script_index += 1;
             }
             Long("send") => {
-                login_actions.push(Send(os_to_string(parser.value()?, "--send")?));
+                login_actions.push(Input(os_to_string(parser.value()?, "--send")?));
             }
             Long("expect") => {
                 let text = os_to_string(parser.value()?, "--expect")?;
@@ -366,7 +368,10 @@ fn script_command_from_path(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let script = fs::read_to_string(path)
         .map_err(|err| format!("Failed to read script {}: {err}", path.display()))?;
-    let label = format!("{}_{}", index, path.file_name().unwrap().display());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("Script path has no file name: {}", path.display()))?;
+    let label = format!("{}_{}", index, file_name.to_string_lossy());
     script_command_from_content(&label, &script)
 }
 
@@ -375,22 +380,22 @@ fn script_command_from_content(
     script: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let marker = "VIBE_SCRIPT_EOF";
-    let guest_dir = "/tmp/vibe-scripts";
-    let guest_path = format!("{guest_dir}/{label}.sh");
-    let command = format!(
-        "mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n{guest_path}"
-    );
     if script.contains(marker) {
         return Err(
             format!("Script '{label}' contains marker '{marker}', cannot safely upload").into(),
         );
     }
+    let guest_dir = "/tmp/vibe-scripts";
+    let guest_path = format!("{guest_dir}/{label}.sh");
+    let command = format!(
+        "mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n{guest_path}"
+    );
     Ok(command)
 }
 
-fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
+fn motd_login_action(directory_shares: &[DirectoryShare]) -> LoginAction {
     if directory_shares.is_empty() {
-        return Some(Send("clear".into()));
+        return Input("clear\n".into());
     }
 
     let host_header = "Host";
@@ -450,7 +455,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
     }
 
     let command = format!("clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
-    Some(Send(command))
+    Input(command)
 }
 
 #[derive(PartialEq, Eq)]
@@ -459,7 +464,7 @@ enum WaitResult {
     Found,
 }
 
-pub enum VmInput {
+enum VmInput {
     Bytes(Vec<u8>),
     Shutdown,
 }
@@ -469,17 +474,25 @@ enum VmOutput {
 }
 
 #[derive(Default)]
-pub struct OutputMonitor {
+struct OutputMonitor {
     buffer: Mutex<String>,
     condvar: Condvar,
 }
 
 impl OutputMonitor {
     fn push(&self, bytes: &[u8]) {
-        self.buffer
-            .lock()
-            .unwrap()
-            .push_str(&String::from_utf8_lossy(bytes));
+        let mut buf = self.buffer.lock().unwrap();
+        buf.push_str(&String::from_utf8_lossy(bytes));
+        const MAX_BUFFER: usize = 1024 * 1024; // 1 MB
+        if buf.len() > MAX_BUFFER {
+            let drain_to = buf.len() - MAX_BUFFER;
+            // Find the next char boundary at or after drain_to to avoid splitting multi-byte chars.
+            let boundary = (drain_to..=buf.len())
+                .find(|&i| buf.is_char_boundary(i))
+                .unwrap_or(buf.len());
+            buf.drain(..boundary);
+        }
+        drop(buf);
         self.condvar.notify_all();
     }
 
@@ -593,7 +606,7 @@ fn ensure_default_image(
     let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
     run_vm(
         default_raw,
-        &[Send(provision_command)],
+        &[Input(provision_command)],
         directory_shares,
         DEFAULT_CPU_COUNT,
         DEFAULT_RAM_BYTES,
@@ -616,7 +629,7 @@ fn ensure_instance_disk(
     Ok(())
 }
 
-pub struct IoContext {
+struct IoContext {
     pub input_tx: Sender<VmInput>,
     wakeup_write: OwnedFd,
     stdin_thread: thread::JoinHandle<()>,
@@ -625,12 +638,12 @@ pub struct IoContext {
     stdout_thread: thread::JoinHandle<()>,
 }
 
-pub fn create_pipe() -> (OwnedFd, OwnedFd) {
+fn create_pipe() -> (OwnedFd, OwnedFd) {
     let (read_stream, write_stream) = UnixStream::pair().expect("Failed to create socket pair");
     (read_stream.into(), write_stream.into())
 }
 
-pub fn spawn_vm_io(
+fn spawn_vm_io(
     output_monitor: Arc<OutputMonitor>,
     vm_output_fd: OwnedFd,
     vm_input_fd: OwnedFd,
@@ -665,7 +678,17 @@ pub fn spawn_vm_io(
         ];
 
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if ret <= 0 || fds[1].revents & libc::POLLIN != 0 {
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return PollResult::Spurious;
+            }
+            return PollResult::Error;
+        }
+        if ret == 0 {
+            return PollResult::Spurious;
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
             PollResult::Shutdown
         } else if fds[0].revents & libc::POLLIN != 0 {
             let n = unsafe { libc::read(main_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -827,149 +850,170 @@ fn create_vm_configuration(
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
+    // SAFETY: objc2 FFI — all alloc/init patterns follow Apple's documented initialization
+    // contracts. Objects are memory-managed by Retained<T> wrappers and will not outlive
+    // the references passed to setter methods within this function.
+    let platform = unsafe {
+        VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc())
+    };
+    let boot_loader = unsafe { VZEFIBootLoader::init(VZEFIBootLoader::alloc()) };
+    let variable_store = load_efi_variable_store()?;
+    unsafe { boot_loader.setVariableStore(Some(&variable_store)) };
+
+    let config = unsafe { VZVirtualMachineConfiguration::new() };
     unsafe {
-        let platform =
-            VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc());
-
-        let boot_loader = VZEFIBootLoader::init(VZEFIBootLoader::alloc());
-        let variable_store = load_efi_variable_store()?;
-        boot_loader.setVariableStore(Some(&variable_store));
-
-        let config = VZVirtualMachineConfiguration::new();
         config.setPlatform(&platform);
         config.setBootLoader(Some(&boot_loader));
         config.setCPUCount(cpu_count as NSUInteger);
         config.setMemorySize(ram_bytes);
+    }
 
+    // SAFETY: network and entropy device constructors follow standard alloc/init patterns.
+    unsafe {
         config.setNetworkDevices(&NSArray::from_retained_slice(&[{
             let network_device = VZVirtioNetworkDeviceConfiguration::new();
             network_device.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
             Retained::into_super(network_device)
         }]));
-
         config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             VZVirtioEntropyDeviceConfiguration::new(),
         )]));
+    }
 
-        ////////////////////////////
-        // Disks
-        {
-            let disk_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+    ////////////////////////////
+    // Disks
+    {
+        // nsurl_from_path is safe Rust; ? propagates errors before entering unsafe.
+        let disk_url = nsurl_from_path(disk_path)?;
+        // SAFETY: disk_url is a valid file:// URL pointing to an existing path.
+        let disk_attachment = unsafe {
+            VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                 VZDiskImageStorageDeviceAttachment::alloc(),
-                &nsurl_from_path(disk_path).unwrap(),
+                &disk_url,
                 false,
                 VZDiskImageCachingMode::Cached,
                 VZDiskImageSynchronizationMode::Full,
-            ).unwrap();
-
-            let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+            )?
+        };
+        let disk_device = unsafe {
+            VZVirtioBlockDeviceConfiguration::initWithAttachment(
                 VZVirtioBlockDeviceConfiguration::alloc(),
                 &disk_attachment,
-            );
-
-            let storage_devices: Retained<NSArray<_>> =
-                NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
-
-            config.setStorageDevices(&storage_devices);
+            )
         };
+        let storage_devices: Retained<NSArray<_>> =
+            NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
+        unsafe { config.setStorageDevices(&storage_devices) };
+    }
 
-        ////////////////////////////
-        // Directory shares
+    ////////////////////////////
+    // Directory shares
 
-        if !directory_shares.is_empty() {
-            let directories: Retained<NSMutableDictionary<NSString, VZSharedDirectory>> =
-                NSMutableDictionary::new();
+    if !directory_shares.is_empty() {
+        let directories: Retained<NSMutableDictionary<NSString, VZSharedDirectory>> =
+            NSMutableDictionary::new();
 
-            for share in directory_shares.iter() {
-                assert!(
-                    share.host.is_dir(),
-                    "path does not exist or is not a directory: {:?}",
-                    share.host
-                );
-
-                let url = nsurl_from_path(&share.host)?;
-                let shared_directory = VZSharedDirectory::initWithURL_readOnly(
+        for share in directory_shares.iter() {
+            // Safe Rust: assert and path resolution happen outside unsafe.
+            assert!(
+                share.host.is_dir(),
+                "path does not exist or is not a directory: {:?}",
+                share.host
+            );
+            let url = nsurl_from_path(&share.host)?;
+            let key = NSString::from_str(&share.tag());
+            // SAFETY: VZSharedDirectory init with a valid file URL.
+            let shared_directory = unsafe {
+                VZSharedDirectory::initWithURL_readOnly(
                     VZSharedDirectory::alloc(),
                     &url,
                     share.read_only,
-                );
+                )
+            };
+            unsafe {
+                directories
+                    .setObject_forKey(&*shared_directory, ProtocolObject::from_ref(&*key))
+            };
+        }
 
-                let key = NSString::from_str(&share.tag());
-                directories.setObject_forKey(&*shared_directory, ProtocolObject::from_ref(&*key));
-            }
-
-            let multi_share = VZMultipleDirectoryShare::initWithDirectories(
+        // SAFETY: all contained objects are fully initialized Retained<T> values.
+        let multi_share = unsafe {
+            VZMultipleDirectoryShare::initWithDirectories(
                 VZMultipleDirectoryShare::alloc(),
                 &directories,
-            );
-
-            let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            )
+        };
+        let device = unsafe {
+            VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
                 &NSString::from_str(SHARED_DIRECTORIES_TAG),
-            );
-            device.setShare(Some(&multi_share));
+            )
+        };
+        unsafe { device.setShare(Some(&multi_share)) };
+        let share_devices =
+            NSArray::from_retained_slice(&[device.into_super()]);
+        unsafe { config.setDirectorySharingDevices(&share_devices) };
+    }
 
-            let share_devices = NSArray::from_retained_slice(&[device.into_super()]);
-            config.setDirectorySharingDevices(&share_devices);
-        }
+    ////////////////////////////
+    // Serial ports
+    // SAFETY: NSFileHandle takes ownership of the file descriptor (closeOnDealloc = true).
+    // The OwnedFd is consumed via into_raw_fd() so there is no double-close.
+    {
+        let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            vm_reads_from_fd.into_raw_fd(),
+            true,
+        );
+        let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            vm_writes_to_fd.into_raw_fd(),
+            true,
+        );
+        let serial_attach = unsafe {
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                Some(&ns_read_handle),
+                Some(&ns_write_handle),
+            )
+        };
+        let serial_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+        unsafe { serial_port.setAttachment(Some(&serial_attach)) };
 
-        ////////////////////////////
-        // Serial ports
-        {
-            let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                NSFileHandle::alloc(),
-                vm_reads_from_fd.into_raw_fd(),
-                true,
-            );
+        let resize_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            resize_reads_from_fd.into_raw_fd(),
+            true,
+        );
+        let resize_attach = unsafe {
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                Some(&resize_read_handle),
+                None,
+            )
+        };
+        let resize_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+        unsafe { resize_port.setAttachment(Some(&resize_attach)) };
 
-            let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                NSFileHandle::alloc(),
-                vm_writes_to_fd.into_raw_fd(),
-                true,
-            );
+        let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+            Retained::into_super(serial_port),
+            Retained::into_super(resize_port),
+        ]);
+        unsafe { config.setSerialPorts(&serial_ports) };
+    }
 
-            let serial_attach =
-                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                    VZFileHandleSerialPortAttachment::alloc(),
-                    Some(&ns_read_handle),
-                    Some(&ns_write_handle),
-                );
-            let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-            serial_port.setAttachment(Some(&serial_attach));
-
-            let resize_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                NSFileHandle::alloc(),
-                resize_reads_from_fd.into_raw_fd(),
-                true,
-            );
-            let resize_attach =
-                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                    VZFileHandleSerialPortAttachment::alloc(),
-                    Some(&resize_read_handle),
-                    None,
-                );
-            let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-            resize_port.setAttachment(Some(&resize_attach));
-
-            let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-                Retained::into_super(serial_port),
-                Retained::into_super(resize_port),
-            ]);
-
-            config.setSerialPorts(&serial_ports);
-        }
-
-        ////////////////////////////
-        // Validate
+    ////////////////////////////
+    // Validate
+    unsafe {
         config.validateWithError().map_err(|e| {
             io::Error::other(format!(
                 "Invalid VM configuration: {:?}",
                 e.localizedDescription()
             ))
         })?;
-
-        Ok(config)
     }
+
+    Ok(config)
 }
 
 fn load_efi_variable_store() -> Result<Retained<VZEFIVariableStore>, Box<dyn std::error::Error>> {
@@ -1005,9 +1049,11 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
-                Send(mut text) => {
+                Input(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                    if input_tx.send(VmInput::Bytes(text.into_bytes())).is_err() {
+                        return;
+                    }
                 }
                 Script { path, index } => {
                     let command = match script_command_from_path(&path, index) {
@@ -1019,7 +1065,9 @@ fn spawn_login_actions_thread(
                     };
                     let mut text = command;
                     text.push('\n');
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                    if input_tx.send(VmInput::Bytes(text.into_bytes())).is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -1107,16 +1155,16 @@ fn run_vm(
             text: "login: ".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
-        Send("root".to_string()),
+        Input("root".to_string()),
         Expect {
             text: "~#".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
-        Send("stty -F /dev/hvc0 sane".to_string()),
+        Input("stty -F /dev/hvc0 sane".to_string()),
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
-        Send({
+        Input({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
             const S: &str = "sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
@@ -1124,8 +1172,8 @@ fn run_vm(
     ];
 
     if !directory_shares.is_empty() {
-        all_login_actions.push(Send("mkdir -p /mnt/shared".into()));
-        all_login_actions.push(Send(format!(
+        all_login_actions.push(Input("mkdir -p /mnt/shared".into()));
+        all_login_actions.push(Input(format!(
             "mount -t virtiofs {} /mnt/shared",
             SHARED_DIRECTORIES_TAG
         )));
@@ -1133,8 +1181,8 @@ fn run_vm(
         for share in directory_shares {
             let staging = format!("/mnt/shared/{}", share.tag());
             let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Send(format!("mkdir -p {}", guest)));
-            all_login_actions.push(Send(format!("mount --bind {} {}", staging, guest)));
+            all_login_actions.push(Input(format!("mkdir -p {}", shell_quote(&guest))));
+            all_login_actions.push(Input(format!("mount --bind {} {}", shell_quote(&staging), shell_quote(&guest))));
         }
     }
 
@@ -1162,7 +1210,6 @@ fn run_vm(
 
         let state = unsafe { vm.state() };
         if last_state != Some(state) {
-            //eprintln!("[state] {:?}", state);
             last_state = Some(state);
         }
         match vm_output_rx.try_recv() {
@@ -1185,10 +1232,11 @@ fn run_vm(
                 break;
             }
             Err(mpsc::TryRecvError::Empty) => {}
+            // Disconnected means the login-actions thread exited (either all actions
+            // completed successfully, or the thread encountered an error and returned).
             Err(mpsc::TryRecvError::Disconnected) => {}
         }
         if state != objc2_virtualization::VZVirtualMachineState::Running {
-            //eprintln!("VM stopped with state: {:?}", state);
             break;
         }
     }
@@ -1196,6 +1244,13 @@ fn run_vm(
     let _ = login_actions_thread.join();
 
     io_ctx.shutdown();
+
+    // Clean up the EFI variable store temp file created by load_efi_variable_store.
+    let efi_temp = std::env::temp_dir().join(format!(
+        "efi_variable_store_{}.efivars",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&efi_temp);
 
     exit_result
 }
@@ -1262,13 +1317,13 @@ impl Drop for RawModeGuard {
 }
 
 // Ensure the running binary has com.apple.security.virtualization entitlements by checking and, if not, signing and relaunching.
-pub fn ensure_signed() {
+fn ensure_signed() {
     let exe = std::env::current_exe().expect("failed to get current exe path");
     let exe_str = exe.to_str().expect("exe path not valid utf-8");
 
     let has_required_entitlements = {
         let output = Command::new("codesign")
-            .args(["-d", "--entitlements", "-", "--xml", exe.to_str().unwrap()])
+            .args(["-d", "--entitlements", "-", "--xml", exe_str])
             .output();
 
         match output {
@@ -1315,5 +1370,49 @@ pub fn ensure_signed() {
             eprintln!("failed to run codesign: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_plain() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn shell_quote_spaces() {
+        assert_eq!(shell_quote("my project"), "'my project'");
+    }
+
+    #[test]
+    fn shell_quote_single_quotes() {
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn mount_spec_basic() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/mnt:read-write").unwrap();
+        assert_eq!(share.guest, std::path::PathBuf::from("/mnt"));
+        assert!(!share.read_only);
+    }
+
+    #[test]
+    fn mount_spec_read_only() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/mnt:read-only").unwrap();
+        assert!(share.read_only);
+    }
+
+    #[test]
+    fn mount_spec_invalid_mode() {
+        assert!(DirectoryShare::from_mount_spec("/tmp:/mnt:banana").is_err());
+    }
+
+    #[test]
+    fn script_marker_collision_rejected() {
+        let result = script_command_from_content("test", "echo VIBE_SCRIPT_EOF");
+        assert!(result.is_err());
     }
 }
