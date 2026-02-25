@@ -42,6 +42,10 @@ const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_SCRIPT: &str = include_str!("provision.sh");
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[derive(Clone)]
 enum LoginAction {
     Expect { text: String, timeout: Duration },
@@ -208,14 +212,14 @@ Options
     let mut directory_shares = Vec::new();
 
     if !args.no_default_mounts {
-        login_actions.push(Send(format!("cd {project_name}")));
+        login_actions.push(Send(format!("cd {}", shell_quote(&project_name))));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
         for subfolder in [".git", ".vibe"] {
             if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r"mount -t tmpfs tmpfs {}", subfolder)))
+                login_actions.push(Send(format!(r"mount -t tmpfs tmpfs {}", shell_quote(subfolder))))
             }
         }
 
@@ -375,16 +379,16 @@ fn script_command_from_content(
     script: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let marker = "VIBE_SCRIPT_EOF";
-    let guest_dir = "/tmp/vibe-scripts";
-    let guest_path = format!("{guest_dir}/{label}.sh");
-    let command = format!(
-        "mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n{guest_path}"
-    );
     if script.contains(marker) {
         return Err(
             format!("Script '{label}' contains marker '{marker}', cannot safely upload").into(),
         );
     }
+    let guest_dir = "/tmp/vibe-scripts";
+    let guest_path = format!("{guest_dir}/{label}.sh");
+    let command = format!(
+        "mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n{guest_path}"
+    );
     Ok(command)
 }
 
@@ -665,7 +669,17 @@ pub fn spawn_vm_io(
         ];
 
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if ret <= 0 || fds[1].revents & libc::POLLIN != 0 {
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return PollResult::Spurious;
+            }
+            return PollResult::Error;
+        }
+        if ret == 0 {
+            return PollResult::Spurious;
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
             PollResult::Shutdown
         } else if fds[0].revents & libc::POLLIN != 0 {
             let n = unsafe { libc::read(main_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -860,7 +874,7 @@ fn create_vm_configuration(
                 false,
                 VZDiskImageCachingMode::Cached,
                 VZDiskImageSynchronizationMode::Full,
-            ).unwrap();
+            )?;
 
             let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
                 VZVirtioBlockDeviceConfiguration::alloc(),
@@ -1007,7 +1021,9 @@ fn spawn_login_actions_thread(
                 }
                 Send(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                    if input_tx.send(VmInput::Bytes(text.into_bytes())).is_err() {
+                        return;
+                    }
                 }
                 Script { path, index } => {
                     let command = match script_command_from_path(&path, index) {
@@ -1019,7 +1035,9 @@ fn spawn_login_actions_thread(
                     };
                     let mut text = command;
                     text.push('\n');
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                    if input_tx.send(VmInput::Bytes(text.into_bytes())).is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -1133,8 +1151,8 @@ fn run_vm(
         for share in directory_shares {
             let staging = format!("/mnt/shared/{}", share.tag());
             let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Send(format!("mkdir -p {}", guest)));
-            all_login_actions.push(Send(format!("mount --bind {} {}", staging, guest)));
+            all_login_actions.push(Send(format!("mkdir -p {}", shell_quote(&guest))));
+            all_login_actions.push(Send(format!("mount --bind {} {}", shell_quote(&staging), shell_quote(&guest))));
         }
     }
 
@@ -1185,6 +1203,8 @@ fn run_vm(
                 break;
             }
             Err(mpsc::TryRecvError::Empty) => {}
+            // Disconnected means the login-actions thread exited (either all actions
+            // completed successfully, or the thread encountered an error and returned).
             Err(mpsc::TryRecvError::Disconnected) => {}
         }
         if state != objc2_virtualization::VZVirtualMachineState::Running {
