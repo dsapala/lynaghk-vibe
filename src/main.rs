@@ -480,10 +480,18 @@ pub struct OutputMonitor {
 
 impl OutputMonitor {
     fn push(&self, bytes: &[u8]) {
-        self.buffer
-            .lock()
-            .unwrap()
-            .push_str(&String::from_utf8_lossy(bytes));
+        let mut buf = self.buffer.lock().unwrap();
+        buf.push_str(&String::from_utf8_lossy(bytes));
+        const MAX_BUFFER: usize = 1024 * 1024; // 1 MB
+        if buf.len() > MAX_BUFFER {
+            let drain_to = buf.len() - MAX_BUFFER;
+            // Find the next char boundary at or after drain_to to avoid splitting multi-byte chars.
+            let boundary = (drain_to..=buf.len())
+                .find(|&i| buf.is_char_boundary(i))
+                .unwrap_or(buf.len());
+            buf.drain(..boundary);
+        }
+        drop(buf);
         self.condvar.notify_all();
     }
 
@@ -841,149 +849,170 @@ fn create_vm_configuration(
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
+    // SAFETY: objc2 FFI — all alloc/init patterns follow Apple's documented initialization
+    // contracts. Objects are memory-managed by Retained<T> wrappers and will not outlive
+    // the references passed to setter methods within this function.
+    let platform = unsafe {
+        VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc())
+    };
+    let boot_loader = unsafe { VZEFIBootLoader::init(VZEFIBootLoader::alloc()) };
+    let variable_store = load_efi_variable_store()?;
+    unsafe { boot_loader.setVariableStore(Some(&variable_store)) };
+
+    let config = unsafe { VZVirtualMachineConfiguration::new() };
     unsafe {
-        let platform =
-            VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc());
-
-        let boot_loader = VZEFIBootLoader::init(VZEFIBootLoader::alloc());
-        let variable_store = load_efi_variable_store()?;
-        boot_loader.setVariableStore(Some(&variable_store));
-
-        let config = VZVirtualMachineConfiguration::new();
         config.setPlatform(&platform);
         config.setBootLoader(Some(&boot_loader));
         config.setCPUCount(cpu_count as NSUInteger);
         config.setMemorySize(ram_bytes);
+    }
 
+    // SAFETY: network and entropy device constructors follow standard alloc/init patterns.
+    unsafe {
         config.setNetworkDevices(&NSArray::from_retained_slice(&[{
             let network_device = VZVirtioNetworkDeviceConfiguration::new();
             network_device.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
             Retained::into_super(network_device)
         }]));
-
         config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             VZVirtioEntropyDeviceConfiguration::new(),
         )]));
+    }
 
-        ////////////////////////////
-        // Disks
-        {
-            let disk_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+    ////////////////////////////
+    // Disks
+    {
+        // nsurl_from_path is safe Rust; ? propagates errors before entering unsafe.
+        let disk_url = nsurl_from_path(disk_path)?;
+        // SAFETY: disk_url is a valid file:// URL pointing to an existing path.
+        let disk_attachment = unsafe {
+            VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                 VZDiskImageStorageDeviceAttachment::alloc(),
-                &nsurl_from_path(disk_path).unwrap(),
+                &disk_url,
                 false,
                 VZDiskImageCachingMode::Cached,
                 VZDiskImageSynchronizationMode::Full,
-            )?;
-
-            let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+            )?
+        };
+        let disk_device = unsafe {
+            VZVirtioBlockDeviceConfiguration::initWithAttachment(
                 VZVirtioBlockDeviceConfiguration::alloc(),
                 &disk_attachment,
-            );
-
-            let storage_devices: Retained<NSArray<_>> =
-                NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
-
-            config.setStorageDevices(&storage_devices);
+            )
         };
+        let storage_devices: Retained<NSArray<_>> =
+            NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
+        unsafe { config.setStorageDevices(&storage_devices) };
+    }
 
-        ////////////////////////////
-        // Directory shares
+    ////////////////////////////
+    // Directory shares
 
-        if !directory_shares.is_empty() {
-            let directories: Retained<NSMutableDictionary<NSString, VZSharedDirectory>> =
-                NSMutableDictionary::new();
+    if !directory_shares.is_empty() {
+        let directories: Retained<NSMutableDictionary<NSString, VZSharedDirectory>> =
+            NSMutableDictionary::new();
 
-            for share in directory_shares.iter() {
-                assert!(
-                    share.host.is_dir(),
-                    "path does not exist or is not a directory: {:?}",
-                    share.host
-                );
-
-                let url = nsurl_from_path(&share.host)?;
-                let shared_directory = VZSharedDirectory::initWithURL_readOnly(
+        for share in directory_shares.iter() {
+            // Safe Rust: assert and path resolution happen outside unsafe.
+            assert!(
+                share.host.is_dir(),
+                "path does not exist or is not a directory: {:?}",
+                share.host
+            );
+            let url = nsurl_from_path(&share.host)?;
+            let key = NSString::from_str(&share.tag());
+            // SAFETY: VZSharedDirectory init with a valid file URL.
+            let shared_directory = unsafe {
+                VZSharedDirectory::initWithURL_readOnly(
                     VZSharedDirectory::alloc(),
                     &url,
                     share.read_only,
-                );
+                )
+            };
+            unsafe {
+                directories
+                    .setObject_forKey(&*shared_directory, ProtocolObject::from_ref(&*key))
+            };
+        }
 
-                let key = NSString::from_str(&share.tag());
-                directories.setObject_forKey(&*shared_directory, ProtocolObject::from_ref(&*key));
-            }
-
-            let multi_share = VZMultipleDirectoryShare::initWithDirectories(
+        // SAFETY: all contained objects are fully initialized Retained<T> values.
+        let multi_share = unsafe {
+            VZMultipleDirectoryShare::initWithDirectories(
                 VZMultipleDirectoryShare::alloc(),
                 &directories,
-            );
-
-            let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            )
+        };
+        let device = unsafe {
+            VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
                 &NSString::from_str(SHARED_DIRECTORIES_TAG),
-            );
-            device.setShare(Some(&multi_share));
+            )
+        };
+        unsafe { device.setShare(Some(&multi_share)) };
+        let share_devices =
+            NSArray::from_retained_slice(&[device.into_super()]);
+        unsafe { config.setDirectorySharingDevices(&share_devices) };
+    }
 
-            let share_devices = NSArray::from_retained_slice(&[device.into_super()]);
-            config.setDirectorySharingDevices(&share_devices);
-        }
+    ////////////////////////////
+    // Serial ports
+    // SAFETY: NSFileHandle takes ownership of the file descriptor (closeOnDealloc = true).
+    // The OwnedFd is consumed via into_raw_fd() so there is no double-close.
+    {
+        let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            vm_reads_from_fd.into_raw_fd(),
+            true,
+        );
+        let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            vm_writes_to_fd.into_raw_fd(),
+            true,
+        );
+        let serial_attach = unsafe {
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                Some(&ns_read_handle),
+                Some(&ns_write_handle),
+            )
+        };
+        let serial_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+        unsafe { serial_port.setAttachment(Some(&serial_attach)) };
 
-        ////////////////////////////
-        // Serial ports
-        {
-            let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                NSFileHandle::alloc(),
-                vm_reads_from_fd.into_raw_fd(),
-                true,
-            );
+        let resize_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            resize_reads_from_fd.into_raw_fd(),
+            true,
+        );
+        let resize_attach = unsafe {
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                Some(&resize_read_handle),
+                None,
+            )
+        };
+        let resize_port = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+        unsafe { resize_port.setAttachment(Some(&resize_attach)) };
 
-            let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                NSFileHandle::alloc(),
-                vm_writes_to_fd.into_raw_fd(),
-                true,
-            );
+        let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+            Retained::into_super(serial_port),
+            Retained::into_super(resize_port),
+        ]);
+        unsafe { config.setSerialPorts(&serial_ports) };
+    }
 
-            let serial_attach =
-                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                    VZFileHandleSerialPortAttachment::alloc(),
-                    Some(&ns_read_handle),
-                    Some(&ns_write_handle),
-                );
-            let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-            serial_port.setAttachment(Some(&serial_attach));
-
-            let resize_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                NSFileHandle::alloc(),
-                resize_reads_from_fd.into_raw_fd(),
-                true,
-            );
-            let resize_attach =
-                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                    VZFileHandleSerialPortAttachment::alloc(),
-                    Some(&resize_read_handle),
-                    None,
-                );
-            let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-            resize_port.setAttachment(Some(&resize_attach));
-
-            let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-                Retained::into_super(serial_port),
-                Retained::into_super(resize_port),
-            ]);
-
-            config.setSerialPorts(&serial_ports);
-        }
-
-        ////////////////////////////
-        // Validate
+    ////////////////////////////
+    // Validate
+    unsafe {
         config.validateWithError().map_err(|e| {
             io::Error::other(format!(
                 "Invalid VM configuration: {:?}",
                 e.localizedDescription()
             ))
         })?;
-
-        Ok(config)
     }
+
+    Ok(config)
 }
 
 fn load_efi_variable_store() -> Result<Retained<VZEFIVariableStore>, Box<dyn std::error::Error>> {
@@ -1216,6 +1245,13 @@ fn run_vm(
     let _ = login_actions_thread.join();
 
     io_ctx.shutdown();
+
+    // Clean up the EFI variable store temp file created by load_efi_variable_store.
+    let efi_temp = std::env::temp_dir().join(format!(
+        "efi_variable_store_{}.efivars",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&efi_temp);
 
     exit_result
 }
