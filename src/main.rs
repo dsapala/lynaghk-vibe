@@ -49,10 +49,10 @@ fn shell_quote(s: &str) -> String {
 #[derive(Clone)]
 enum LoginAction {
     Expect { text: String, timeout: Duration },
-    Send(String),
+    Input(String),
     Script { path: PathBuf, index: usize },
 }
-use LoginAction::*;
+use LoginAction::{Expect, Input, Script};
 
 #[derive(Clone)]
 struct DirectoryShare {
@@ -212,14 +212,14 @@ Options
     let mut directory_shares = Vec::new();
 
     if !args.no_default_mounts {
-        login_actions.push(Send(format!("cd {}", shell_quote(&project_name))));
+        login_actions.push(Input(format!("cd {}", shell_quote(&project_name))));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
         for subfolder in [".git", ".vibe"] {
             if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r"mount -t tmpfs tmpfs {}", shell_quote(subfolder))))
+                login_actions.push(Input(format!(r"mount -t tmpfs tmpfs {}", shell_quote(subfolder))))
             }
         }
 
@@ -257,9 +257,7 @@ Options
         directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
     }
 
-    if let Some(motd_action) = motd_login_action(&directory_shares) {
-        login_actions.push(motd_action);
-    }
+    login_actions.push(motd_login_action(&directory_shares));
 
     // Any user-provided login actions must come after our system ones
     login_actions.extend(args.login_actions);
@@ -332,7 +330,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 script_index += 1;
             }
             Long("send") => {
-                login_actions.push(Send(os_to_string(parser.value()?, "--send")?));
+                login_actions.push(Input(os_to_string(parser.value()?, "--send")?));
             }
             Long("expect") => {
                 let text = os_to_string(parser.value()?, "--expect")?;
@@ -370,7 +368,10 @@ fn script_command_from_path(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let script = fs::read_to_string(path)
         .map_err(|err| format!("Failed to read script {}: {err}", path.display()))?;
-    let label = format!("{}_{}", index, path.file_name().unwrap().display());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("Script path has no file name: {}", path.display()))?;
+    let label = format!("{}_{}", index, file_name.to_string_lossy());
     script_command_from_content(&label, &script)
 }
 
@@ -392,9 +393,9 @@ fn script_command_from_content(
     Ok(command)
 }
 
-fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
+fn motd_login_action(directory_shares: &[DirectoryShare]) -> LoginAction {
     if directory_shares.is_empty() {
-        return Some(Send("clear".into()));
+        return Input("clear\n".into());
     }
 
     let host_header = "Host";
@@ -454,7 +455,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
     }
 
     let command = format!("clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
-    Some(Send(command))
+    Input(command)
 }
 
 #[derive(PartialEq, Eq)]
@@ -463,7 +464,7 @@ enum WaitResult {
     Found,
 }
 
-pub enum VmInput {
+enum VmInput {
     Bytes(Vec<u8>),
     Shutdown,
 }
@@ -473,7 +474,7 @@ enum VmOutput {
 }
 
 #[derive(Default)]
-pub struct OutputMonitor {
+struct OutputMonitor {
     buffer: Mutex<String>,
     condvar: Condvar,
 }
@@ -605,7 +606,7 @@ fn ensure_default_image(
     let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
     run_vm(
         default_raw,
-        &[Send(provision_command)],
+        &[Input(provision_command)],
         directory_shares,
         DEFAULT_CPU_COUNT,
         DEFAULT_RAM_BYTES,
@@ -628,7 +629,7 @@ fn ensure_instance_disk(
     Ok(())
 }
 
-pub struct IoContext {
+struct IoContext {
     pub input_tx: Sender<VmInput>,
     wakeup_write: OwnedFd,
     stdin_thread: thread::JoinHandle<()>,
@@ -637,12 +638,12 @@ pub struct IoContext {
     stdout_thread: thread::JoinHandle<()>,
 }
 
-pub fn create_pipe() -> (OwnedFd, OwnedFd) {
+fn create_pipe() -> (OwnedFd, OwnedFd) {
     let (read_stream, write_stream) = UnixStream::pair().expect("Failed to create socket pair");
     (read_stream.into(), write_stream.into())
 }
 
-pub fn spawn_vm_io(
+fn spawn_vm_io(
     output_monitor: Arc<OutputMonitor>,
     vm_output_fd: OwnedFd,
     vm_input_fd: OwnedFd,
@@ -1048,7 +1049,7 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
-                Send(mut text) => {
+                Input(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
                     if input_tx.send(VmInput::Bytes(text.into_bytes())).is_err() {
                         return;
@@ -1154,16 +1155,16 @@ fn run_vm(
             text: "login: ".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
-        Send("root".to_string()),
+        Input("root".to_string()),
         Expect {
             text: "~#".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
-        Send("stty -F /dev/hvc0 sane".to_string()),
+        Input("stty -F /dev/hvc0 sane".to_string()),
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
-        Send({
+        Input({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
             const S: &str = "sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
@@ -1171,8 +1172,8 @@ fn run_vm(
     ];
 
     if !directory_shares.is_empty() {
-        all_login_actions.push(Send("mkdir -p /mnt/shared".into()));
-        all_login_actions.push(Send(format!(
+        all_login_actions.push(Input("mkdir -p /mnt/shared".into()));
+        all_login_actions.push(Input(format!(
             "mount -t virtiofs {} /mnt/shared",
             SHARED_DIRECTORIES_TAG
         )));
@@ -1180,8 +1181,8 @@ fn run_vm(
         for share in directory_shares {
             let staging = format!("/mnt/shared/{}", share.tag());
             let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Send(format!("mkdir -p {}", shell_quote(&guest))));
-            all_login_actions.push(Send(format!("mount --bind {} {}", shell_quote(&staging), shell_quote(&guest))));
+            all_login_actions.push(Input(format!("mkdir -p {}", shell_quote(&guest))));
+            all_login_actions.push(Input(format!("mount --bind {} {}", shell_quote(&staging), shell_quote(&guest))));
         }
     }
 
@@ -1209,7 +1210,6 @@ fn run_vm(
 
         let state = unsafe { vm.state() };
         if last_state != Some(state) {
-            //eprintln!("[state] {:?}", state);
             last_state = Some(state);
         }
         match vm_output_rx.try_recv() {
@@ -1237,7 +1237,6 @@ fn run_vm(
             Err(mpsc::TryRecvError::Disconnected) => {}
         }
         if state != objc2_virtualization::VZVirtualMachineState::Running {
-            //eprintln!("VM stopped with state: {:?}", state);
             break;
         }
     }
@@ -1318,13 +1317,13 @@ impl Drop for RawModeGuard {
 }
 
 // Ensure the running binary has com.apple.security.virtualization entitlements by checking and, if not, signing and relaunching.
-pub fn ensure_signed() {
+fn ensure_signed() {
     let exe = std::env::current_exe().expect("failed to get current exe path");
     let exe_str = exe.to_str().expect("exe path not valid utf-8");
 
     let has_required_entitlements = {
         let output = Command::new("codesign")
-            .args(["-d", "--entitlements", "-", "--xml", exe.to_str().unwrap()])
+            .args(["-d", "--entitlements", "-", "--xml", exe_str])
             .output();
 
         match output {
@@ -1371,5 +1370,49 @@ pub fn ensure_signed() {
             eprintln!("failed to run codesign: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_plain() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn shell_quote_spaces() {
+        assert_eq!(shell_quote("my project"), "'my project'");
+    }
+
+    #[test]
+    fn shell_quote_single_quotes() {
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn mount_spec_basic() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/mnt:read-write").unwrap();
+        assert_eq!(share.guest, std::path::PathBuf::from("/mnt"));
+        assert!(!share.read_only);
+    }
+
+    #[test]
+    fn mount_spec_read_only() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/mnt:read-only").unwrap();
+        assert!(share.read_only);
+    }
+
+    #[test]
+    fn mount_spec_invalid_mode() {
+        assert!(DirectoryShare::from_mount_spec("/tmp:/mnt:banana").is_err());
+    }
+
+    #[test]
+    fn script_marker_collision_rejected() {
+        let result = script_command_from_content("test", "echo VIBE_SCRIPT_EOF");
+        assert!(result.is_err());
     }
 }
